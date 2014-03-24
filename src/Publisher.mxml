@@ -1,0 +1,609 @@
+<?xml version="1.0" encoding="utf-8"?>
+<s:Application xmlns:fx="http://ns.adobe.com/mxml/2009"
+			   xmlns:mx="library://ns.adobe.com/flex/mx"
+			   xmlns:s="library://ns.adobe.com/flex/spark"
+			   minWidth="955" minHeight="600" backgroundColor="0xEEEEEE" initialize="init()">
+	<fx:Script>
+		<![CDATA[
+			import com.kaltura.commands.cuePoint.CuePointAdd;
+			import com.kaltura.commands.session.SessionStart;
+			import com.kaltura.config.KalturaConfig;
+			import com.kaltura.events.KalturaEvent;
+			import com.kaltura.types.KalturaAdProtocolType;
+			import com.kaltura.types.KalturaAdType;
+			import com.kaltura.types.KalturaSchemaType;
+			import com.kaltura.types.KalturaSessionType;
+			import com.kaltura.vo.KalturaAdCuePoint;
+			
+			import org.osmf.elements.F4MElement;
+			import org.osmf.elements.ProxyElement;
+			import org.osmf.events.MediaElementEvent;
+			import org.osmf.events.MediaPlayerStateChangeEvent;
+			import org.osmf.events.TimelineMetadataEvent;
+			import org.osmf.media.MediaPlayerSprite;
+			import org.osmf.media.URLResource;
+			import org.osmf.metadata.CuePoint;
+			import org.osmf.metadata.TimelineMetadata;
+			
+			private var netConnection : PublisherConnection;
+			private var netConnection2 : PublisherConnection;
+			private var nsPlay : NetStream;
+			private var camera : Camera;
+			private var microphone : Microphone;
+			private var manifestElement:F4MElement;
+			private var manifestPlaying:Boolean;
+			
+			private var lastSyncPoint:Object = null;
+			private var ks:String = null;
+			
+			protected var sessionKey:String;
+			
+			private function init() : void
+			{
+				
+				startKalturaSession();
+			}
+			
+			private function startKalturaSession() : void
+			{
+				var secret:String = txtSecret.text;
+				var userId:String = "encoder-demo";
+				var type:int = KalturaSessionType.ADMIN;
+				var partnerId:int = parseInt(txtPartnerId.text);
+				
+				var config:KalturaConfig = new KalturaConfig();
+				config.partnerId = txtPartnerId.text;
+				config.domain = txtApiDomain.text;
+				
+				var sessionStart:SessionStart = new SessionStart(secret, userId, type, partnerId);
+				sessionStart.config = config;
+				sessionStart.addEventListener(KalturaEvent.COMPLETE, onSessionStarted);
+				sessionStart.addEventListener(KalturaEvent.FAILED, onSessionStartFailed);
+				sessionStart.execute();
+			}
+			
+			public function onSessionStarted(event:KalturaEvent) : void
+			{
+				ks = event.data as String; 
+				trace("Session started [" + ks + "]");
+			}
+			
+			public function onSessionStartFailed(event:KalturaEvent) : void
+			{
+				trace("Failed starting session [" + event.error.errorMsg + "]");
+			}
+			
+			public function onPlayerStateChange( event:MediaPlayerStateChangeEvent ) : void
+			{
+				switch(event.state)
+				{
+					case "buffering":
+					case "playing":
+						if(!manifestPlaying)
+						{
+							manifestPlaying = true;
+							trace("Playing");
+
+							//						btnPausePlay.enabled = true;
+							//						btnStopPlay.enabled = true;
+							
+							var media:Object = manifestElement;
+							while (media is ProxyElement)
+							{
+								media = (media as ProxyElement).proxiedElement;
+							} 
+							if (media.hasOwnProperty("client") && media["client"]) {
+								media["client"].addHandler( "onTextData", onTextData );
+								media["client"].addHandler( "onMetaData", onMetaData );
+							}
+						}
+						break;
+					
+					case "loading":
+						trace("Loading player");
+						manifestPlaying = false;
+						break;
+					
+					case "playbackError":
+						trace("Player error");
+						btnPlay.enabled = true;
+//						btnPausePlay.enabled = false;
+//						btnStopPlay.enabled = false;
+						break;
+					
+					default:
+						trace("Unhandled player state: " + event.state);
+				}
+			}
+			
+			private function netStatus( event : NetStatusEvent ) : void 
+			{	
+				if(event.info.description)
+					trace(event.info.description);	
+				
+				switch(event.info.code)
+				{
+					case "NetConnection.Connect.Rejected":
+					case "NetConnection.Connect.Failed":
+						btnConnect.enabled = true;
+						break;
+					
+					case "NetConnection.Connect.Success":
+						trace("level: " + event.info.level);	
+						trace("objectEncoding: " + event.info.objectEncoding);
+						btnDisconnect.enabled = true;
+						btnPlay.enabled = true;
+						btnPublish.enabled = true;
+						break;
+					
+					case "NetConnection.Connect.Closed":
+						trace("Connection closed");
+						btnConnect.enabled = true;
+						btnPlay.enabled = false;
+						btnPublish.enabled = false;
+						btnAddCuePoint.enabled = false;
+						break;
+					
+					case "NetStream.Unpublish.Success":
+						btnPublish.enabled = true;
+						btnAddCuePoint.enabled = false;
+						break;
+					
+					case "NetStream.Publish.Start":
+						btnStopPublish.enabled = true;
+						btnPausePublish.enabled = true;
+						btnSendCuePoint.enabled = true;
+						break;
+						
+					case "NetStream.Play.UnpublishNotify":
+					case "NetStream.Play.StreamNotFound":
+						btnPlay.enabled = true;
+						btnPausePlay.enabled = false;
+						btnStopPlay.enabled = false;
+						break;
+						
+					default:
+						trace("Unhandled netStatus code: " + event.info.code);
+				}
+			}
+			
+			private function disconnect() : void
+			{
+				btnDisconnect.enabled = false;
+				netConnection.close();
+				
+				if(netConnection2)
+					netConnection2.close();
+			}
+			
+			private function connect() : void
+			{
+				btnConnect.enabled = false;
+				
+				sessionKey = "encoder:1.2.3.4:" + txtUsername.text;
+				
+				var args : String = txtConnectArguments.text;
+				var uri: String = txtServer.text;
+				
+				if(args.length > 0)
+					uri += "?" + args;
+				
+				netConnection = new PublisherConnection(txtUsername.text, txtPassword.text);
+				
+				netConnection.addDelegatedEventListener( NetStatusEvent.NET_STATUS, netStatus );
+				netConnection.addDelegatedEventListener( AsyncErrorEvent.ASYNC_ERROR, netASyncError );
+				netConnection.addDelegatedEventListener( SecurityErrorEvent.SECURITY_ERROR, netSecurityError );
+				netConnection.addDelegatedEventListener( IOErrorEvent.IO_ERROR, netIOError );
+				try {
+					trace( "Connecting to " + uri);
+					netConnection.connect(uri, sessionKey, "", "2.0");
+				}
+				catch( e : ArgumentError ) 
+				{
+					// Invalid parameters.
+					switch ( e.errorID ) 
+					{
+						case 2004 :
+							trace( "Invalid server location: " + uri);
+							break;
+						
+						default :
+							break;
+					}
+					return;
+				}
+				
+				if(txtBackupServer.text.length > 0)
+				{
+					uri = txtBackupServer.text;
+					
+					if(args.length > 0)
+						uri += "?" + args;
+					
+					netConnection2 = new PublisherConnection(txtUsername.text, txtPassword.text);
+					
+					netConnection2.addDelegatedEventListener( NetStatusEvent.NET_STATUS, netStatus );
+					netConnection2.addDelegatedEventListener( AsyncErrorEvent.ASYNC_ERROR, netASyncError );
+					netConnection2.addDelegatedEventListener( SecurityErrorEvent.SECURITY_ERROR, netSecurityError );
+					netConnection2.addDelegatedEventListener( IOErrorEvent.IO_ERROR, netIOError );
+					try {
+						trace( "Connecting to " + uri);
+						netConnection2.connect(uri, sessionKey, "", "2.0");
+					}
+					catch( e : ArgumentError ) 
+					{
+						// Invalid parameters.
+						switch ( e.errorID ) 
+						{
+							case 2004 :
+								trace( "Invalid server location: " + uri);
+								break;
+							
+							default :
+								break;
+						}
+					}
+				}
+			}
+			
+			private function close() : void
+			{
+				netConnection.close();
+				if(netConnection2)
+					netConnection2.close();
+			}
+			
+			private function netSecurityError( event : SecurityErrorEvent ) : void 
+			{
+				trace("Net Security Error: " + event.text);
+			}
+			
+			private function netIOError( event : IOErrorEvent ) : void 
+			{
+				trace("Net IO Error: " + event.text);
+			}
+			
+			private function netASyncError( event : AsyncErrorEvent ) : void 
+			{
+				trace("Net ASync Error: " + event.text);
+			}			
+			
+			private function play() : void
+			{				
+				btnPlay.enabled = false;
+				
+				if(txtPlayUrl.text.length > 0)
+				{
+					playDisplay.removeChildren();
+					
+					var mediaPlayerSprite:MediaPlayerSprite = new MediaPlayerSprite();
+					manifestElement = new F4MElement();
+					manifestElement.resource = new URLResource(txtPlayUrl.text);
+					
+					playDisplay.addChild(mediaPlayerSprite);
+					mediaPlayerSprite.mediaPlayer.addEventListener(MediaPlayerStateChangeEvent.MEDIA_PLAYER_STATE_CHANGE, onPlayerStateChange);
+					mediaPlayerSprite.media = manifestElement;
+				}
+				else
+				{	
+					manifestElement = null;
+					
+					var audio : Boolean = true;
+					var video : Boolean = true;
+					var streamName : String = txtStreamName.text;
+					
+					
+					try 
+					{
+						// Check for reconnect.
+						if ( nsPlay != null ) 
+						{
+							// Stop and close previous NetStream.
+							trace("Play stream stopped");
+						}
+						// Setup NetStream for playback.
+						nsPlay = new NetStream(netConnection);
+						nsPlay.addEventListener( NetStatusEvent.NET_STATUS, netStatus );
+						nsPlay.addEventListener( IOErrorEvent.IO_ERROR, netIOError );
+						nsPlay.addEventListener( AsyncErrorEvent.ASYNC_ERROR, netASyncError );
+	//					nsPlay.bufferTime = bufferTime;
+						nsPlay.receiveAudio( audio );
+						nsPlay.receiveVideo( video );
+						nsPlay.client = {
+							onMetaData: this.onMetaData
+						};
+						
+						var videoRemote : Video = new Video( 400, 300 );
+						videoRemote.attachNetStream( nsPlay );
+						playDisplay.addChild(videoRemote);
+	
+						nsPlay.play( streamName );
+						
+					}
+					catch( e : ArgumentError ) 
+					{
+						// Invalid parameters
+						switch ( e.errorID ) 
+						{
+							// NetStream object must be connected.
+							case 2126 :
+								trace( "Can't play stream, not connected to server");
+								break;
+							default :
+								break;
+						}
+					}
+				}
+			}
+			
+			private function stopPlay() : void
+			{
+				btnStopPlay.enabled = false;
+				if ( nsPlay != null ) 
+				{
+					// Close the NetStream.
+					nsPlay.close();
+				}
+			}
+			
+			private function pausePlay() : void
+			{
+				btnPausePlay.enabled = false;
+				// Pause the NetStream.
+				nsPlay.pause();
+			}
+			
+			private function resumePlay() : void
+			{
+				btnResumePlay.enabled = false;
+				// Resume playback for the NetStream.
+				nsPlay.resume();
+			}
+			
+			public function onTextData( metadata : Object ) : void
+			{
+				trace(metadata);
+			}
+			
+			public function onMetaData( metadata : Object ) : void
+			{
+				if(metadata.hasOwnProperty("objectType"))
+				{
+					switch(metadata.objectType)
+					{
+						case "KalturaSyncPoint":
+							lastSyncPoint = {
+								offset: metadata.offset,
+								time: new Date()
+							};
+							trace("Sync-point [" + metadata.id + "] offset [" + metadata.offset + "] now [" + lastSyncPoint.time + "]");
+							btnAddCuePoint.enabled = true;
+							break;
+						
+						default:
+							trace("Metadata: " + metadata.objectType);
+					}
+				}
+			}
+			
+			private function publish() : void
+			{
+				btnPublish.enabled = false;
+				
+				if(chkVideo.selected)
+				{
+					camera = Camera.getCamera();
+					camera.setQuality(90000, 0);
+					camera.setMode(400, 300, 30, true);
+					camera.setKeyFrameInterval(15);
+				}
+				else
+				{
+					camera = null;
+				}
+				
+				if(chkAudio.selected)
+				{
+					microphone = Microphone.getMicrophone();
+					microphone.setSilenceLevel(0);
+					microphone.setUseEchoSuppression(true);
+					microphone.gain=90
+					//					microphone.encodeQuality = 5;
+					//					microphone.framesPerPacket = 1;
+						
+					microphone.codec = listAudioCodec.selectedItem;
+				}
+				else
+				{
+					microphone = null;
+				}
+				
+				
+				if ( microphone != null || camera != null ) 
+				{
+					netConnection.publish(txtStreamName.text, listType.selectedItem, camera, microphone, chkH264.selected);
+					if(netConnection2)
+						netConnection2.publish(txtStreamName.text, listType.selectedItem, camera, microphone, chkH264.selected);
+				}
+			}
+			
+			private function stopPublish() : void
+			{
+				btnStopPublish.enabled = false;
+				netConnection.stopPublish();
+				if(netConnection2)
+					netConnection2.stopPublish();
+			}
+			
+			private function pausePublish() : void
+			{
+				btnPausePublish.enabled = false;
+				netConnection.pausePublish();
+				if(netConnection2)
+					netConnection2.pausePublish();
+			}
+			
+			private function resumePublish() : void
+			{
+				btnResumePublish.enabled = false;
+				netConnection.resumePublish();
+				if(netConnection2)
+					netConnection2.resumePublish();
+			}
+			
+			private var adId:int = 1;
+			private function sendCuePoint() : void
+			{
+				var metaData:Object = new Object(); 
+				metaData.objectType = "KalturaAdCuePoint"; 
+				metaData.id = "test" + (adId++);  
+				metaData.startTime = 4000; 
+				metaData.endTime = 14000;  
+				metaData.duration = 10000; 
+				
+				netConnection.sendPublish("onMetaData", metaData);
+				if(netConnection2)
+					netConnection2.sendPublish("onMetaData", metaData);
+			}
+			
+			private function addMetadata() : void
+			{
+				if(!lastSyncPoint)
+					return;
+				
+				var config:KalturaConfig = new KalturaConfig();
+				config.partnerId = txtPartnerId.text;
+				config.domain = txtApiDomain.text;
+				config.ks = ks;
+				
+				var now:Date = new Date();
+				var offset:int = lastSyncPoint.offset + (now.time - lastSyncPoint.time.time);
+				var duration:int = 52000;
+				
+				var cuePoint:KalturaAdCuePoint = new KalturaAdCuePoint(); 
+				cuePoint.entryId = txtEntryId.text; 
+				cuePoint.startTime = offset; 
+				cuePoint.endTime = offset + duration;  
+				cuePoint.protocolType = KalturaAdProtocolType.VAST;
+				cuePoint.adType = KalturaAdType.VIDEO;
+				cuePoint.sourceUrl = "http://lbd.kaltura.com/redirectAd.xml";
+				cuePoint.title = "iab_vast_samples_creatives";
+				
+				var cuePointAdd:CuePointAdd = new CuePointAdd(cuePoint);
+				cuePointAdd.config = config;
+				cuePointAdd.addEventListener(KalturaEvent.COMPLETE, onCuePointAdd);
+				cuePointAdd.addEventListener(KalturaEvent.FAILED, onCuePointFailed);
+				cuePointAdd.execute();
+			}
+			
+			public function onCuePointAdd(event:KalturaEvent) : void
+			{
+				var cuePoint:KalturaAdCuePoint = event.data as KalturaAdCuePoint; 
+				trace("Added new live cue-point [" + cuePoint.id + "]");
+			}
+			
+			public function onCuePointFailed(event:KalturaEvent) : void
+			{
+				trace("Failed adding live cue-point [" + event.error.errorMsg + "]");
+			}
+			
+		]]>
+	</fx:Script>
+	<mx:VBox>
+		<mx:UIComponent id="playDisplay" width="400" height="300" visible="true" />
+		<mx:HBox>
+			<s:Label text="URL: "/>
+			<s:TextInput id="txtServer"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Backup URL: "/>
+			<s:TextInput id="txtBackupServer"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Arguments: "/>
+			<s:TextInput id="txtConnectArguments"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Stream Name: "/>
+			<s:TextInput id="txtStreamName"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Entry ID: "/>
+			<s:TextInput id="txtEntryId"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Play URL: "/>
+			<s:TextInput id="txtPlayUrl"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Username: "/>
+			<s:TextInput id="txtUsername"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Password: "/>
+			<s:TextInput id="txtPassword"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Type: "/>
+			<s:DropDownList id="listType">
+				<mx:ArrayCollection>
+					<fx:String>live</fx:String>
+					<fx:String>record</fx:String>
+					<fx:String>append</fx:String>
+				</mx:ArrayCollection>
+			</s:DropDownList>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Audio Codec: "/>
+			<s:DropDownList id="listAudioCodec">
+				<mx:ArrayCollection>
+					<fx:String>NellyMoser</fx:String>
+					<fx:String>pcma</fx:String>
+					<fx:String>pcmu</fx:String>
+					<fx:String>Speex</fx:String>
+				</mx:ArrayCollection>
+			</s:DropDownList>
+		</mx:HBox>
+		<mx:HBox>
+			<s:CheckBox id="chkAudio" label="Enable Audio" selected="true" />
+			<s:CheckBox id="chkVideo" label="Enable Video" selected="true" />
+			<s:CheckBox id="chkH264" label="H.264" />
+			<s:CheckBox id="chkAkamai" label="Akamai" />
+		</mx:HBox>
+		<mx:HBox>
+			<s:Button id="btnConnect" label="connect" click="connect()"/>
+			<s:Button id="btnDisconnect" label="disconnect" click="disconnect()" enabled="false"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Button id="btnPublish" label="publish" click="publish()" enabled="false"/>
+			<s:Button id="btnPausePublish" label="pause publish" click="pausePublish()"
+					  enabled="false"/>
+			<s:Button id="btnResumePublish" label="resume publish" click="resumePublish()"
+					  enabled="false"/>
+			<s:Button id="btnStopPublish" label="stop publish" click="stopPublish()" enabled="false"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Button id="btnPlay" label="play" click="play()" enabled="false"/>
+			<s:Button id="btnPausePlay" label="pause play" click="pausePlay()" enabled="false"/>
+			<s:Button id="btnResumePlay" label="resume play" click="resumePlay()" enabled="false"/>
+			<s:Button id="btnStopPlay" label="stop play" click="stopPlay()" enabled="false"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="API domain: "/>
+			<s:TextInput id="txtApiDomain"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Partner ID: "/>
+			<s:TextInput id="txtPartnerId"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Label text="Secret: "/>
+			<s:TextInput id="txtSecret"/>
+		</mx:HBox>
+		<mx:HBox>
+			<s:Button id="btnSendCuePoint" label="send cue-point (RTMP)" click="sendCuePoint()" enabled="false"/>
+			<s:Button id="btnAddCuePoint" label="add cue-point (API)" click="addMetadata()" enabled="false"/>
+		</mx:HBox>
+	</mx:VBox>
+</s:Application>
+
